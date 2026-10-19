@@ -143,51 +143,79 @@ class Detector:
         logger.info(f"[Detector][Init] Initilizating detection modules...")
 
         if cfg.run_detection:
+            # RKNPU3 backends (AIBOX): when use_npu is set the detector models
+            # run on the NPU; CLIP below still loads in torch (CPU) for
+            # init-time prompts and arbitrary text queries.
+            self.use_npu = bool(getattr(cfg, "use_npu", False))
+            self.npu_model_dir = str(getattr(cfg, "npu_model_dir", "") or "model/npu")
+            self.clip_image_npu = None
+            if self.use_npu:
+                from utils.npu_backends import ClipImageNPU, MobileSamNPU, YOLOWorldNPU
+
+                yolo_npu = YOLOWorldNPU(self.npu_model_dir)
+                if yolo_npu.names != self.obj_classes.get_classes_arr():
+                    raise ValueError(
+                        f"NPU graph vocabulary ({len(yolo_npu.names)} names) does not match the "
+                        f"class file ({len(self.obj_classes.get_classes_arr())} names); recompile "
+                        "the graph or align the class list"
+                    )
+                self.yolo = yolo_npu
+                self.sam = MobileSamNPU(self.npu_model_dir, cfg.sam.model_path)
+                self.clip_image_npu = ClipImageNPU(self.npu_model_dir)
             try:
                 # CLIP module
                 logger.info(
                     f"[Detector][Init] Loading CLIP model: {cfg.clip.model_name} with pretrained weights '{cfg.clip.pretrained}'"
                 )
 
-                self.clip_model, _, self.clip_preprocess = (
-                    open_clip.create_model_and_transforms(
-                        cfg.clip.model_name, pretrained=cfg.clip.pretrained
+                # NPU mode always uses the openai ViT-B/32 text tower (same
+                # embedding space the YOLO-World NPU graph expects). Loading
+                # via the `clip` package avoids open_clip's torch.load path,
+                # which rejects legacy checkpoints on torch 2.6+ (the board
+                # has torch 2.7+; open_clip 1.x doesn't accept weights_only).
+                if self.use_npu and cfg.clip.model_name == "ViT-B-32":
+                    import clip as _openai_clip
+                    self.clip_model, self.clip_preprocess = _openai_clip.load(
+                        cfg.clip.pretrained, device=cfg.device, download_root=os.path.dirname(cfg.clip.pretrained) or "."
                     )
-                )
-                self.clip_model = self.clip_model.to(cfg.device)
-                self.clip_model.eval()
-
-                # Only reparameterize if the model is MobileCLIP
-                if "MobileCLIP" in cfg.clip.model_name:
-                    from mobileclip.modules.common.mobileone import reparameterize_model
-
-                    self.clip_model = reparameterize_model(self.clip_model)
-
-                self.clip_tokenizer = open_clip.get_tokenizer(cfg.clip.model_name)
+                    self.clip_tokenizer = _openai_clip.tokenize
+                else:
+                    self.clip_model, _, self.clip_preprocess = (
+                        open_clip.create_model_and_transforms(
+                            cfg.clip.model_name, pretrained=cfg.clip.pretrained
+                        )
+                    )
+                    self.clip_model = self.clip_model.to(cfg.device)
+                    self.clip_model.eval()
+                    if "MobileCLIP" in cfg.clip.model_name:
+                        from mobileclip.modules.common.mobileone import reparameterize_model
+                        self.clip_model = reparameterize_model(self.clip_model)
+                    self.clip_tokenizer = open_clip.get_tokenizer(cfg.clip.model_name)
             except Exception as e:
                 logger.error(f"[Detector][Init] Error loading CLIP model: {e}")
                 return
 
-            try:
-                # Detection module
-                logger.info(
-                    f"[Detector][Init] Loading YOLO model from\t{cfg.yolo.model_path}"
-                )
-                self.yolo = YOLO(cfg.yolo.model_path)
-                self.yolo.set_classes(self.obj_classes.get_classes_arr())
-            except Exception as e:
-                logger.error(f"[Detector][Init] Error loading YOLO model: {e}")
-                return
+            if not self.use_npu:
+                try:
+                    # Detection module
+                    logger.info(
+                        f"[Detector][Init] Loading YOLO model from\t{cfg.yolo.model_path}"
+                    )
+                    self.yolo = YOLO(cfg.yolo.model_path)
+                    self.yolo.set_classes(self.obj_classes.get_classes_arr())
+                except Exception as e:
+                    logger.error(f"[Detector][Init] Error loading YOLO model: {e}")
+                    return
 
-            try:
-                # Segmentation module
-                logger.info(
-                    f"[Detector][Init] Loading SAM model from\t{cfg.sam.model_path}"
-                )
-                self.sam = SAM(cfg.sam.model_path)
-            except Exception as e:
-                logger.error(f"[Detector][Init] Error loading SAM model: {e}")
-                return
+                try:
+                    # Segmentation module
+                    logger.info(
+                        f"[Detector][Init] Loading SAM model from\t{cfg.sam.model_path}"
+                    )
+                    self.sam = SAM(cfg.sam.model_path)
+                except Exception as e:
+                    logger.error(f"[Detector][Init] Error loading SAM model: {e}")
+                    return
 
             # Open fastsam for open vocabulary detection
             if cfg.use_fastsam:
@@ -226,6 +254,15 @@ class Detector:
             )
             self.class_feats = class_feats
 
+            if self.clip_image_npu is not None:
+                # Per-frame text features in the NPU path come from this cache
+                # (same values encode_text produced per frame before).
+                with torch.no_grad():
+                    toks = self.clip_tokenizer(self.obj_classes.get_classes_arr())
+                    feats = self.clip_model.encode_text(toks)
+                    feats = feats / feats.norm(dim=-1, keepdim=True)
+                self.plain_text_feats = feats.cpu().numpy()
+
             # Used for unknown class
             if cfg.use_avg_feat_for_unknown:
                 class_feats_mean = np.mean(class_feats, axis=0)
@@ -240,6 +277,72 @@ class Detector:
                     skip_refinement=self.cfg.skip_refinement,
                 )
                 self.filter.set_device(self.cfg.device)
+                logger.info(f"[Detector][Init] filter ready, use_npu={self.use_npu}, "
+                            f"class_feats={self.class_feats.shape}")
+
+    # ── NPU detection pipeline ────────────────────────────────────────────
+    def _process_detections_npu(self) -> None:
+        """Re-implement process_detections on the RKNPU3 backends.
+
+        Mirrors the torch pipeline: YOLO -> SAM (boxes -> masks) -> CLIP
+        crops (image features) + per-class text features. ``Filter`` and
+        ``process_masks`` still run, but they consume a precomputed
+        ``sv.Detections`` so the rest of DualMap (calculate_observations,
+        LocalMapManager) is unchanged."""
+        import supervision as sv
+
+        color = self.curr_data.color.astype(np.uint8)
+
+        with timing_context("NPU YOLO", self):
+            res = self.yolo.predict(color, conf=0.2)
+            r = res[0].boxes
+            if len(r.conf) == 0:
+                self.curr_detections = sv.Detections.empty()
+                self.curr_results = {}
+                return
+            boxes, confs, classes = r.xyxy.numpy(), r.conf.numpy(), r.cls.numpy().astype(int)
+
+        with timing_context("NPU SAM", self):
+            sam_res = self.sam.predict(color, bboxes=boxes)
+            masks = sam_res[0].masks.data.numpy().astype(bool)
+
+        with timing_context("NPU CLIP", self):
+            self.curr_detections = sv.Detections(
+                xyxy=boxes.astype(np.float32),
+                confidence=confs.astype(np.float32),
+                class_id=classes.astype(np.int64),
+                mask=masks,
+            )
+            self.filter.update_detections(self.curr_detections, color)
+            filtered = self.filter.run_filter()
+            if self.filter.get_len() == 0:
+                self.curr_detections = sv.Detections.empty()
+                self.curr_results = {}
+                return
+            self.curr_detections = filtered
+
+        with timing_context("NPU masks+clip", self):
+            cluster_thread = threading.Thread(
+                target=self.process_masks, args=(self.curr_detections.mask,)
+            )
+            cluster_thread.start()
+            with timing_context("CLIP", self):
+                _, image_feats, text_feats = self.compute_clip_features_batched(
+                    color, self.curr_detections,
+                    self.clip_model, self.clip_tokenizer, self.clip_preprocess,
+                    self.cfg.device, self.obj_classes.get_classes_arr(),
+                )
+            cluster_thread.join()
+
+        self.curr_results = {
+            "xyxy": self.curr_detections.xyxy,
+            "confidence": self.curr_detections.confidence,
+            "class_id": self.curr_detections.class_id,
+            "masks": self.curr_detections.mask,
+            "image_feats": image_feats,
+            "text_feats": text_feats,
+        }
+
 
         # for filtering the pose of follower camera for visualization
         self.pose_filter_follower = PoseLowPassFilter(alpha=0.95)
@@ -657,6 +760,10 @@ class Detector:
         return merged_detctions
 
     def process_detections(self):
+
+        if self.use_npu:
+            self._process_detections_npu()
+            return
 
         color = self.curr_data.color.astype(np.uint8)
 
@@ -1414,6 +1521,20 @@ class Detector:
         device,
         classes,
     ):
+        if self.clip_image_npu is not None:
+            image_feats = self.clip_image_npu.encode_crops(image, detections.xyxy)
+            norms = np.linalg.norm(image_feats, axis=1, keepdims=True)
+            image_feats = image_feats / np.maximum(norms, 1e-6)
+            text_feats = self.plain_text_feats[detections.class_id].copy()
+            for idx, class_id in enumerate(detections.class_id):
+                if class_id == self.unknown_class_id:
+                    if self.cfg.use_avg_feat_for_unknown:
+                        text_feats[idx] = self.class_feats_mean
+                    else:
+                        rand = np.random.rand(*self.class_feats_mean.shape)
+                        text_feats[idx] = rand / np.linalg.norm(rand)
+            return [], image_feats, text_feats
+
         # Convert the image to a PIL Image
         image = Image.fromarray(image)
 

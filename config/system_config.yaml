@@ -58,6 +58,13 @@ clip:
 
 device: cuda
 
+# Run the detector models (YOLO-World, MobileSAM encoder, CLIP image tower)
+# on an RKNPU3 device (AIBOX RK1828). The RKNN artifacts live in npu_model_dir
+# (yoloworld.rknn/.weight, yoloworld_text.npy, npu_meta.json, mobilesam.rknn/
+# .weight, clip_image.rknn/.weight); CLIP text still runs in torch on the CPU.
+use_npu: False
+npu_model_dir: model/npu
+
 
 # ============================================================
 # DUALMAP CONFIG

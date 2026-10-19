@@ -17,3 +17,5 @@ __pycache__/
 
 *.pt
 *.bin
+# Generated RKNPU3 weights exceed GitHub regular-file limit; deploy separately.
+model/npu/*.weight
