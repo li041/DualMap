@@ -122,6 +122,29 @@ Follow the [Offline Query Guide](resources/doc/app_offline_query.md) to run the 
 The system supports both [Rerun](https://rerun.io) and [Rviz](http://wiki.ros.org/rviz) visualization. When running with ROS, you can switch the visualizaiton via `use_rerun` and `use_rviz` option in `config/runner_ros.yaml`
 
 
+## RKNPU3 Backend (AIBOX / RK1828)
+
+With `use_npu=true` and `npu_model_dir`, the per-frame heavy models run as
+fixed-shape FP16 RKNN graphs on the RK1828: YOLO-World v2s (vocabulary baked
+via `set_classes`, pre-NMS output), the MobileSAM TinyViT encoder **and** the
+prompt/mask decoder (one box per call, low-res mask token 0), and the OpenAI
+CLIP ViT-B/32 image tower. The CLIP text tower and mask upsampling stay on
+the CPU, and the letterbox padding is cropped off the decoder logits before
+upsampling. A bundle directory holds each `.rknn` paired with its `.weight`
+plus `npu_meta.json` — its `format: pre_nms` field selects the decode path
+and its `classes` list must match the detector vocabulary
+(`yolo.given_classes_path`).
+
+A prebuilt, board-validated bundle is published as the release
+[`aibox-npu-bundle`](https://github.com/li041/DualMap/releases/tag/aibox-npu-bundle):
+physical-NPU similarity vs torch references — yoloworld 1.00000, mobilesam
+0.99994, mobilesam_decoder 0.99998, clip_image 0.99984. To rebuild the
+graphs, use the robonix conversion pipeline (`syswonder/robonix` ->
+`system/scene/scripts/convert_aibox_models.py` and `fetch_zoo_aibox_models.py`;
+the decoder is exported from
+[li041/MobileSAM](https://github.com/li041/MobileSAM) @ `0cd7b9d`) with the
+RKNN3 toolkit version matching the board firmware API.
+
 ## Citation
 
 If you find our work helpful, please consider starring this repo 🌟 and cite:
