@@ -1,0 +1,17 @@
+dataset_name: 'clio'
+
+ros_topics:
+  rgb: "/dominic/forward/color/image_raw"
+  depth: "/dominic/forward/depth/image_rect_raw"
+  odom: "/dominic/forward/colmap_odom"
+
+# Depth factor: divisor to convert depth values to meters
+# - For 16UC1 (uint16) depth in millimeters (e.g., RealSense, Orbbec): use 1000.0
+# - For 32FC1 (float32) depth in meters (e.g., Isaac Sim, Gazebo): use 1.0
+depth_factor: 1000.0
+
+intrinsic:
+  fx: 372.4634094238281
+  fy: 371.5072021484375
+  cx: 315.9902073557914
+  cy: 254.59437002701452

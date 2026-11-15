@@ -1,0 +1,21 @@
+output/
+outputs/
+results/
+path/
+log/
+temp/
+
+
+data/
+dataset/
+habitat-sim/
+
+
+__pycache__/
+*.pyc
+
+
+*.pt
+*.bin
+# Generated RKNPU3 weights exceed GitHub regular-file limit; deploy separately.
+model/npu/*.weight

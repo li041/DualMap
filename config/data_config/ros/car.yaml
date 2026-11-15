@@ -1,0 +1,19 @@
+dataset_name: 'car'
+
+ros_topics:
+  rgb: "/orbbec_camera/color/image_raw"
+  depth: "/orbbec_camera/depth/image_raw"
+  odom: "/fastlio_odom"
+  camera_info: "/orbbec_camera/color/camera_info"
+
+# Depth factor: divisor to convert depth values to meters
+# - For 16UC1 (uint16) depth in millimeters (e.g., RealSense, Orbbec): use 1000.0
+# - For 32FC1 (float32) depth in meters (e.g., Isaac Sim, Gazebo): use 1.0
+depth_factor: 1000.0
+
+# We use camera to lidar as default extrinsics
+extrinsics:
+  - [-0.03643072, -0.07344723, 0.99663349, 0.05395146]
+  - [-0.99904654, 0.02668624, -0.03455228, 0.00307242]
+  - [-0.02405863, -0.99694200, -0.07434940, 0.75940953]
+  - [0.0, 0.0, 0.0, 1.0]
