@@ -1914,6 +1914,15 @@ def update_bbox(mask):
 
 
 def if_same_distribution(img1, img2, mask1, mask2, sim_threshold):
+    # An empty crop or an empty in-crop mask carries no distribution to
+    # compare; call the pair different instead of dividing by a zero-norm
+    # histogram (NaN), which would kill the whole tick.
+    if img1.size == 0 or img2.size == 0 or not mask1.any() or not mask2.any():
+        logger.warning(
+            "[Detector][Filter] proximity pair with empty masked crop: "
+            f"img {img1.shape}/{img2.shape}, in-crop mask px "
+            f"{int(mask1.sum())}/{int(mask2.sum())}")
+        return False
     # Separate the image into three channels
     b1, g1, r1 = cv2.split(img1)
     b2, g2, r2 = cv2.split(img2)

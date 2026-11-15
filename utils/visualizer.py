@@ -257,7 +257,7 @@ def visualize_result_rgb(
     image: np.ndarray,
     detections: sv.Detections,
     classes: list[str],
-    color: Union[Color, ColorPalette] = ColorPalette.DEFAULT,
+    color: Union[Color, ColorPalette] = ColorPalette.default(),
     instance_random_color: bool = False,
     draw_bboxes: bool = True,
 ) -> np.ndarray:
