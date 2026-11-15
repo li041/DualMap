@@ -59,7 +59,7 @@ def main() -> None:
     masks = sam_res[0].masks.data.numpy()
     print(f"sam: {masks.shape} in {t_sam*1000:.0f}ms (npu encoder {sam.rknn.last_ms:.0f}ms), "
           f"mask px/box: {[int(m.sum()) for m in masks[:6]]}")
-    if args.repeat > 1:  # steady-state decoder timing (first call warms torch up)
+    if args.repeat > 1:  # steady-state decoder timing (first NPU inference warms the graph)
         for i in range(args.repeat - 1):
             t0 = time.time()
             sam.predict(img, bboxes=r.xyxy.numpy())

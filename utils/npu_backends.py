@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """RKNPU3 (RK1828) inference backends for DualMap's per-frame models.
 
-Replaces the three heavy torch models inside ``Detector`` when
-``use_npu=True``: the YOLO-World detector (airockchip 2-input graph, text
-embeddings precomputed), MobileSAM's image encoder (decoder stays on CPU
-torch — its prompt shapes are dynamic), and the CLIP image tower
-(openai ViT-B/32). Letterbox/NMS/mask post-processing runs on the CPU in
-numpy, mirroring ultralytics' preprocessing exactly.
+Replaces the heavy torch models inside ``Detector`` when ``use_npu=True``:
+the YOLO-World detector (airockchip 2-input graph, text embeddings
+precomputed), MobileSAM's image encoder and prompt/mask decoder, and the
+CLIP image tower (openai ViT-B/32). Letterbox/NMS/mask post-processing runs
+on the CPU in numpy/torch, mirroring ultralytics' preprocessing exactly.
 
 Artifacts (``<dir>/``): ``yoloworld.rknn``/``.weight`` (fp16),
 ``yoloworld_text.npy`` ([1,80,512] L2-normalized), ``mobilesam.rknn``/
-``.weight`` (fp16), ``clip_image.rknn``/``.weight`` (fp16),
-``npu_meta.json`` (nc + class list the text embeddings were built for).
+``.weight`` (fp16), ``mobilesam_decoder.rknn``/``.weight`` (fp16),
+``clip_image.rknn``/``.weight`` (fp16), ``npu_meta.json`` (nc + class list
+the text embeddings were built for).
 """
 from __future__ import annotations
 
@@ -44,8 +44,7 @@ def _torch_load(*args, **kwargs):
 
 torch.load = _torch_load
 
-# Some board images start torch single-threaded (no OMP setting, still 1
-# thread), which makes the CPU mask decoder ~3x slower than the cores allow.
+# Torch still handles CLIP text encoding and mask upsampling on the CPU.
 if os.environ.get("OMP_NUM_THREADS") is None and torch.get_num_threads() < 4:
     torch.set_num_threads(max(4, min(8, os.cpu_count() or 4)))
 
@@ -131,8 +130,14 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_th: float) -> list[int]:
 
 
 class YOLOWorldNPU:
-    """airockchip YOLO-World v2s graph: inputs (image float NCHW 0-255,
-    text embeds [1,80,512]), outputs per FPN level (cls sigmoid, ltrb box).
+    """Fixed-vocabulary YOLO-World graphs, two bundle formats:
+
+    - ``npu_meta.json`` without ``format`` (zoo bundles): two-input airockchip
+      graph (image float NCHW 0-255, text embeds), six per-FPN-level outputs
+      (cls sigmoid, ltrb box).
+    - ``"format": "pre_nms"`` (ultralytics self-export): ``set_classes``
+      vocabulary baked into the weights, single uint8 NHWC input, one pre-NMS
+      output [1,4+nc,8400] (cx,cy,w,h in the 640 frame + sigmoided scores).
 
     ``predict()`` mimics the ultralytics results DualMap consumes; the
     vocabulary is fixed at compile time (``npu_meta.json`` records it)."""
@@ -144,15 +149,21 @@ class YOLOWorldNPU:
             meta = json.load(fh)
         self.names = list(meta["classes"])
         self.nc = len(self.names)
-        text = np.load(os.path.join(model_dir, "yoloworld_text.npy")).astype(np.float32)
-        if text.ndim == 2:
-            text = text[None]
-        if text.shape[1] < self.nc:
-            raise RuntimeError(f"text embeddings cover {text.shape[1]} < {self.nc} classes")
-        # Rows past the vocabulary are padding slots; blank them like the
-        # validated artifact does.
-        text[:, self.nc:] = 0.0
-        self.text = text
+        self.pre_nms = meta.get("format") == "pre_nms"
+        if self.pre_nms:
+            # set_classes baked the text embeddings into the weights; the
+            # graph has no text input and no text sidecar exists.
+            self.text = None
+        else:
+            text = np.load(os.path.join(model_dir, "yoloworld_text.npy")).astype(np.float32)
+            if text.ndim == 2:
+                text = text[None]
+            if text.shape[1] < self.nc:
+                raise RuntimeError(f"text embeddings cover {text.shape[1]} < {self.nc} classes")
+            # Rows past the vocabulary are padding slots; blank them like the
+            # validated artifact does.
+            text[:, self.nc:] = 0.0
+            self.text = text
         self.rknn = _RKNN(os.path.join(model_dir, "yoloworld.rknn"),
                           os.path.join(model_dir, "yoloworld.weight"), "yoloworld")
 
@@ -160,33 +171,46 @@ class YOLOWorldNPU:
                 verbose: bool = False) -> list:
         r = min(self.imgsz / color.shape[0], self.imgsz / color.shape[1])
         lb, _ = _letterbox(color, self.imgsz)
-        x = lb.astype(np.float32).transpose(2, 0, 1)[None]
-        outs = self.rknn.inference([x, self.text])
-
-        boxes_all, scores_all, cls_all = [], [], []
-        for lvl in range(3):
-            cls_map = np.asarray(outs[2 * lvl], dtype=np.float32)     # (1,80,h,w)
-            box_map = np.asarray(outs[2 * lvl + 1], dtype=np.float32)  # (1,4,h,w)
-            _, _, h, w = cls_map.shape
-            stride = self.imgsz / h
-            col, row = np.meshgrid(np.arange(w), np.arange(h))
-            grid = np.stack([col, row], axis=0).astype(np.float32)  # (2,h,w)
-            ctr = grid + 0.5
-            xyxy = np.concatenate([(ctr - box_map[0, 0:2]) * stride,
-                                   (ctr + box_map[0, 2:4]) * stride], axis=0)  # (4,h,w)
-            scores = cls_map[0, :self.nc].reshape(self.nc, -1)  # padded slots excluded
-            best = scores.max(axis=0)
-            best_cls = scores.argmax(axis=0)
+        if self.pre_nms:
+            # uint8 NHWC per the input attr; the build config absorbs /255.
+            out = np.asarray(self.rknn.inference([lb[None]])[0], dtype=np.float32)[0]
+            cx, cy, bw, bh = out[:4]
+            boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
+            cls_raw = out[4:self.nc + 4]
+            best = cls_raw.max(axis=0)
+            best_cls = cls_raw.argmax(axis=0)
             pos = best >= conf
-            if pos.any():
-                boxes_all.append(xyxy.reshape(4, -1).T[pos])
-                scores_all.append(best[pos])
-                cls_all.append(best_cls[pos])
-        if not boxes_all:
-            return [_Result(np.zeros((0, 4)), np.zeros(0), np.zeros(0))]
-        boxes = np.concatenate(boxes_all)
-        scores = np.concatenate(scores_all)
-        classes = np.concatenate(cls_all)
+            if not pos.any():
+                return [_Result(np.zeros((0, 4)), np.zeros(0), np.zeros(0))]
+            boxes, scores, classes = boxes[pos], best[pos], best_cls[pos]
+        else:
+            x = lb.astype(np.float32).transpose(2, 0, 1)[None]
+            outs = self.rknn.inference([x, self.text])
+
+            boxes_all, scores_all, cls_all = [], [], []
+            for lvl in range(3):
+                cls_map = np.asarray(outs[2 * lvl], dtype=np.float32)     # (1,80,h,w)
+                box_map = np.asarray(outs[2 * lvl + 1], dtype=np.float32)  # (1,4,h,w)
+                _, _, h, w = cls_map.shape
+                stride = self.imgsz / h
+                col, row = np.meshgrid(np.arange(w), np.arange(h))
+                grid = np.stack([col, row], axis=0).astype(np.float32)  # (2,h,w)
+                ctr = grid + 0.5
+                xyxy = np.concatenate([(ctr - box_map[0, 0:2]) * stride,
+                                       (ctr + box_map[0, 2:4]) * stride], axis=0)  # (4,h,w)
+                scores = cls_map[0, :self.nc].reshape(self.nc, -1)  # padded slots excluded
+                best = scores.max(axis=0)
+                best_cls = scores.argmax(axis=0)
+                pos = best >= conf
+                if pos.any():
+                    boxes_all.append(xyxy.reshape(4, -1).T[pos])
+                    scores_all.append(best[pos])
+                    cls_all.append(best_cls[pos])
+            if not boxes_all:
+                return [_Result(np.zeros((0, 4)), np.zeros(0), np.zeros(0))]
+            boxes = np.concatenate(boxes_all)
+            scores = np.concatenate(scores_all)
+            classes = np.concatenate(cls_all)
         keep_box, keep_conf, keep_cls = [], [], []
         for c in np.unique(classes):
             idx = np.where(classes == c)[0]
@@ -198,6 +222,15 @@ class YOLOWorldNPU:
         scores = np.concatenate(keep_conf)
         classes = np.concatenate(keep_cls)
         boxes /= r  # letterbox -> original pixels
+        # ultralytics scale_boxes clamps boxes into the frame; without it a
+        # stray box makes the proximity filter slice an empty crop and divide
+        # a zero-norm histogram (NaN). Drop boxes the clamp leaves degenerate.
+        h, w = color.shape[:2]
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, w)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, h)
+        ok = (boxes[:, 2] - boxes[:, 0] >= 1) & (boxes[:, 3] - boxes[:, 1] >= 1)
+        if not ok.all():
+            boxes, scores, classes = boxes[ok], scores[ok], classes[ok]
         return [_Result(boxes, scores, classes)]
 
 
@@ -212,44 +245,50 @@ class _SamResult:
 
 
 class MobileSamNPU:
-    """MobileSAM with the TinyViT encoder on the NPU and the prompt/mask
-    decoder on CPU torch. Mirrors ultralytics' ``SAM.predict(color,
-    bboxes=...)``: LetterBox(1024, center=False), mean/std normalization
-    (absorbed by the graph), box prompts scaled by the letterbox ratio,
-    256x256 logits bilinearly resized to the original image, threshold 0."""
+    """MobileSAM with the TinyViT encoder AND the prompt/mask decoder on
+    the NPU (the decoder graph is SamOnnxModel @1024 with the mask resize
+    cut - it emits 256x256 low_res logits, token 0 = the single-mask head).
+    Mirrors ultralytics' ``SAM.predict(color, bboxes=...)``: LetterBox(1024,
+    center=False), mean/std normalization (absorbed by the graph), box
+    prompts fed as two corner points with labels (2, 3), logits bilinearly
+    resized to the original image on CPU, threshold 0. No Torch SAM model or
+    checkpoint is loaded on this path."""
 
-    def __init__(self, model_dir: str, sam_model) -> None:
-        from ultralytics import SAM
-
-        # The decoder needs ultralytics' SAMModel (prompt_encoder +
-        # mask_decoder); reuse the stock loader with the same weights.
-        stock = SAM(sam_model)
-        self.model = stock.model.eval()
+    def __init__(self, model_dir: str, sam_model=None) -> None:
         self.imgsz = 1024
         self.rknn = _RKNN(os.path.join(model_dir, "mobilesam.rknn"),
                           os.path.join(model_dir, "mobilesam.weight"), "mobilesam")
+        self.rknn_dec = _RKNN(os.path.join(model_dir, "mobilesam_decoder.rknn"),
+                              os.path.join(model_dir, "mobilesam_decoder.weight"),
+                              "mobilesam_decoder")
 
     def predict(self, color: np.ndarray, bboxes: np.ndarray, verbose: bool = False) -> list:
         h, w = color.shape[:2]
         r = min(self.imgsz / h, self.imgsz / w)
         lb, _ = _letterbox(color, self.imgsz)
         emb = np.asarray(self.rknn.inference([np.expand_dims(lb, 0)])[0], dtype=np.float32)
-        features = torch.from_numpy(emb)
 
         n = len(bboxes)
         if n == 0:
             return [_SamResult(torch.zeros((0, h, w)))]
-        boxes = torch.as_tensor(np.asarray(bboxes, dtype=np.float32) * r)
-        with torch.no_grad():
-            sparse, dense = self.model.prompt_encoder(points=None, boxes=boxes, masks=None)
-            low_res, _ = self.model.mask_decoder(
-                image_embeddings=features,
-                image_pe=self.model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse,
-                dense_prompt_embeddings=dense,
-                multimask_output=False,
-            )
-        logits = torch.nn.functional.interpolate(low_res.float(), size=(h, w),
+        # one box = two corner points with labels (2, 3), in the 1024 frame
+        low_res = []
+        for x1, y1, x2, y2 in np.asarray(bboxes, dtype=np.float32).reshape(-1, 4) * r:
+            coords = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
+            out = self.rknn_dec.inference([
+                emb, coords, np.array([[2.0, 3.0]], dtype=np.float32),
+                np.zeros((1, 1, 256, 256), dtype=np.float32),
+                np.zeros((1,), dtype=np.float32),
+            ])
+            low_res.append(torch.from_numpy(np.asarray(out[0], dtype=np.float32)[:, :1]))
+        low = torch.cat(low_res)
+        # The decoder sees the whole 1024x1024 letterbox; cut the padding back
+        # off (at the logits' own resolution) before resizing, or the mask
+        # lands squeezed into the content's fraction of the frame (580/1024 of
+        # the height on room0's 680x1200).
+        _, _, lh, lw = low.shape
+        low = low[:, :, :round(lh * h * r / self.imgsz), :round(lw * w * r / self.imgsz)]
+        logits = torch.nn.functional.interpolate(low, size=(h, w),
                                                  mode="bilinear", align_corners=False)
         return [_SamResult((logits[:, 0] > 0.0))]
 
